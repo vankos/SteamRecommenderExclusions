@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Steam Recommender — persistent "Your Relevant Playtime" exclusions
 // @namespace    steamrec
-// @version      3.0.0
-// @description  Remembers Exclude/Include choices in "Your Relevant Playtime" on the Steam Interactive Recommender and re-applies them after reload.
+// @version      3.1.0
+// @description  Remembers Exclude/Include choices in "Your Relevant Playtime" and the tag filters on the Steam Interactive Recommender, and re-applies them after reload.
 // @author       Ivan
 // @match        https://store.steampowered.com/recommender*
 // @include      https://store.steampowered.com/recommender*
@@ -15,6 +15,7 @@
 
   const LOG = '[SteamRec]';
   const KEY_PREFIX = 'steamrec.excluded.v2.';
+  const TAG_KEY_PREFIX = 'steamrec.tags.v1.';
   const DEBUG = /[?&]steamrec_debug=1(?:&|$)/.test(location.search);
   const ACTION_RE = /^(exclude|include|исключить|включить)$/i;
 
@@ -25,6 +26,14 @@
   let lastAutoClick = 0;
   let syncTimer = 0;
   let lastError = null;
+
+  let tagAccountKey = null;
+  let tagStorageKey = null;
+  let savedTags = { filters: [], excludes: [] };
+  let tagsReady = false;
+  let tagsApplying = false;
+  let lastChipClickAt = 0;
+  let lastTagApplyAt = 0;
 
   const stats = {
     buttons: 0,
@@ -213,6 +222,304 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Tag filters (Add Tag Filters / Add Tag Exclusions)
+  // ---------------------------------------------------------------------------
+
+  function wait(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function setNativeValue(input, value) {
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value'
+    ).set;
+    setter.call(input, value);
+  }
+
+  function findTagBlocks() {
+    let inputs = Array.from(
+      document.querySelectorAll('input[placeholder]')
+    ).filter((input) => /tag|тег/i.test(input.placeholder || ''));
+
+    if (!inputs.length) {
+      inputs = Array.from(
+        document.querySelectorAll('input[aria-autocomplete="list"]')
+      );
+    }
+
+    const blocks = { filters: null, excludes: null };
+
+    for (const input of inputs) {
+      const combobox = input.closest('div[role="combobox"]');
+      const block = combobox
+        ? combobox.parentElement
+        : input.parentElement && input.parentElement.parentElement;
+
+      if (!block) continue;
+
+      const text = (block.textContent || '').toLowerCase();
+
+      if (/add tag filters|tag filters|фильтр.*тег|теги.*фильтр/.test(text)) {
+        blocks.filters = block;
+      } else if (
+        /add tag exclusions|tag exclusions|исключ.*тег|теги.*исключ/.test(text)
+      ) {
+        blocks.excludes = block;
+      } else if (!blocks.filters) {
+        blocks.filters = block;
+      } else if (!blocks.excludes) {
+        blocks.excludes = block;
+      }
+    }
+
+    return blocks;
+  }
+
+  function readChips(block) {
+    if (!block) return [];
+
+    const names = [];
+    for (const button of block.querySelectorAll('button')) {
+      const name = (button.textContent || '').trim();
+      if (name && !names.includes(name)) names.push(name);
+    }
+    return names;
+  }
+
+  function findTagBlockForElement(el) {
+    if (!el) return null;
+
+    const blocks = findTagBlocks();
+    if (blocks.filters && blocks.filters.contains(el)) {
+      return { kind: 'filters', block: blocks.filters };
+    }
+    if (blocks.excludes && blocks.excludes.contains(el)) {
+      return { kind: 'excludes', block: blocks.excludes };
+    }
+    return null;
+  }
+
+  function loadTags() {
+    const key = getAccountKey();
+
+    if (tagAccountKey === key && tagStorageKey) return true;
+
+    tagAccountKey = key;
+    tagStorageKey = TAG_KEY_PREFIX + key;
+    savedTags = { filters: [], excludes: [] };
+
+    try {
+      const raw = localStorage.getItem(tagStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          savedTags.filters = Array.isArray(parsed.filters)
+            ? parsed.filters.map(String)
+            : [];
+          savedTags.excludes = Array.isArray(parsed.excludes)
+            ? parsed.excludes.map(String)
+            : [];
+        }
+      }
+    } catch (e) {
+      fail('read tag storage', e);
+    }
+
+    tagsReady = false;
+    log('tags loaded', {
+      tagStorageKey,
+      filters: savedTags.filters.length,
+      excludes: savedTags.excludes.length,
+    });
+    return true;
+  }
+
+  function persistTags() {
+    if (!tagStorageKey) return;
+
+    try {
+      localStorage.setItem(
+        tagStorageKey,
+        JSON.stringify({
+          filters: savedTags.filters,
+          excludes: savedTags.excludes,
+        })
+      );
+      log('tags saved', {
+        tagStorageKey,
+        filters: savedTags.filters.length,
+        excludes: savedTags.excludes.length,
+      });
+    } catch (e) {
+      fail('write tag storage', e);
+    }
+  }
+
+  async function waitForSuggestion(block, name, timeout) {
+    const started = Date.now();
+
+    while (Date.now() - started < timeout) {
+      const options = Array.from(block.querySelectorAll('[role="option"]'));
+      const match = options.find(
+        (option) =>
+          (option.textContent || '').trim().toLowerCase() === name.toLowerCase()
+      );
+      if (match) return match;
+      await wait(50);
+    }
+
+    return null;
+  }
+
+  async function addTag(block, name) {
+    if (!block || !block.isConnected) return false;
+    if (readChips(block).includes(name)) return true;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const input = block.querySelector('input');
+      if (!input) return false;
+
+      try {
+        input.focus();
+      } catch {
+        /* ignore */
+      }
+
+      setNativeValue(input, name);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await wait(120);
+
+      const enter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        code: 'Enter',
+        bubbles: true,
+        cancelable: true,
+      });
+
+      try {
+        Object.defineProperty(enter, 'keyCode', { get: () => 13 });
+        Object.defineProperty(enter, 'which', { get: () => 13 });
+      } catch {
+        /* ignore */
+      }
+
+      input.dispatchEvent(enter);
+      await wait(220);
+
+      if (readChips(block).includes(name)) {
+        setNativeValue(input, '');
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }
+
+      // Fallback: click the matching autocomplete suggestion.
+      const option = await waitForSuggestion(block, name, 600);
+      if (option) {
+        option.dispatchEvent(
+          new MouseEvent('mousedown', { bubbles: true, cancelable: true })
+        );
+        option.dispatchEvent(
+          new MouseEvent('mouseup', { bubbles: true, cancelable: true })
+        );
+        option.click();
+        await wait(220);
+
+        if (readChips(block).includes(name)) {
+          setNativeValue(input, '');
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          return true;
+        }
+      }
+
+      await wait(150);
+    }
+
+    log('tag add failed', { name, html: block.outerHTML.slice(0, 500) });
+    return false;
+  }
+
+  async function applyTags(blocks) {
+    if (tagsApplying) return;
+
+    tagsApplying = true;
+    lastTagApplyAt = Date.now();
+
+    try {
+      for (const kind of ['filters', 'excludes']) {
+        const block = blocks[kind];
+        if (!block) continue;
+
+        const current = readChips(block);
+        const missing = savedTags[kind].filter(
+          (name) => !current.includes(name)
+        );
+
+        for (const name of missing) {
+          await addTag(block, name);
+          await wait(120);
+        }
+
+        const after = readChips(block);
+        const added = after.filter(
+          (name) => !savedTags[kind].includes(name)
+        );
+        if (added.length) {
+          savedTags[kind] = Array.from(new Set([...savedTags[kind], ...added]));
+        }
+      }
+
+      persistTags();
+      tagsReady = true;
+
+      log('tags applied', {
+        filters: savedTags.filters,
+        excludes: savedTags.excludes,
+      });
+    } finally {
+      tagsApplying = false;
+    }
+  }
+
+  function syncTags() {
+    if (tagsApplying) return;
+    if (!loadTags()) return;
+
+    const blocks = findTagBlocks();
+    if (!blocks.filters && !blocks.excludes) return;
+
+    if (!tagsReady) {
+      applyTags(blocks);
+      return;
+    }
+
+    for (const kind of ['filters', 'excludes']) {
+      const block = blocks[kind];
+      if (!block) continue;
+
+      const current = readChips(block);
+      const savedNames = savedTags[kind];
+
+      const added = current.filter((name) => !savedNames.includes(name));
+      if (added.length) {
+        savedTags[kind] = Array.from(new Set([...savedNames, ...added]));
+        persistTags();
+      }
+
+      const removed = savedNames.filter((name) => !current.includes(name));
+      if (
+        removed.length &&
+        Date.now() - lastChipClickAt > 1500 &&
+        Date.now() - lastTagApplyAt > 2000
+      ) {
+        // The page re-rendered and dropped the tag state; restore it.
+        applyTags(blocks);
+        return;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Applying saved choices
   // ---------------------------------------------------------------------------
 
@@ -259,6 +566,7 @@
 
     stats.excluded = buttons.filter(buttonExcluded).length;
     render();
+    syncTags();
   }
 
   function scheduleSync() {
@@ -276,6 +584,25 @@
     (event) => {
       const target = event.target instanceof Element ? event.target : null;
       if (!target) return;
+
+      // Click on a selected tag chip removes it. Save the removal before
+      // React re-renders so syncTags() doesn't put the tag back.
+      const tagBlock = findTagBlockForElement(target);
+      if (tagBlock) {
+        const chip = target.closest('button');
+        if (chip && tagBlock.block.contains(chip)) {
+          const name = (chip.textContent || '').trim();
+          if (name) {
+            lastChipClickAt = Date.now();
+            savedTags[tagBlock.kind] = savedTags[tagBlock.kind].filter(
+              (tag) => tag !== name
+            );
+            persistTags();
+            log('tag removed', { kind: tagBlock.kind, name });
+            return;
+          }
+        }
+      }
 
       const button = target.closest('button');
       if (!button || !isActionButton(button)) return;
@@ -336,6 +663,12 @@
       else if (!firstUnmapped) firstUnmapped = button;
     }
 
+    const tagBlocks = findTagBlocks();
+    const currentTags = {
+      filters: tagBlocks.filters ? readChips(tagBlocks.filters) : [],
+      excludes: tagBlocks.excludes ? readChips(tagBlocks.excludes) : [],
+    };
+
     return {
       url: location.href,
       accountKey,
@@ -349,6 +682,13 @@
       autoClicks: stats.autoClicks,
       lastError,
       unmappedSample: firstUnmapped ? sampleAncestors(firstUnmapped) : null,
+      tags: {
+        key: tagStorageKey,
+        ready: tagsReady,
+        applying: tagsApplying,
+        saved: savedTags,
+        current: currentTags,
+      },
     };
   }
 
@@ -469,14 +809,16 @@
   function render() {
     const badge = ensureBadge();
     const text = badge.querySelector('#steamrec-badge-text');
+    const tagCount = savedTags.filters.length + savedTags.excludes.length;
+    const tagSuffix = tagCount ? ' · tags ' + tagCount : '';
 
     let label;
     if (stats.buttons === 0) {
-      label = 'SteamRec: waiting for buttons…';
+      label = 'SteamRec: waiting for buttons…' + tagSuffix;
     } else if (stats.mapped === 0) {
-      label = 'SteamRec: buttons found, no appid';
+      label = 'SteamRec: buttons found, no appid' + tagSuffix;
     } else {
-      label = 'SteamRec: ' + stats.excluded + ' excluded';
+      label = 'SteamRec: ' + stats.excluded + ' excluded' + tagSuffix;
     }
 
     if (text) text.textContent = label;
@@ -496,6 +838,7 @@
     log('boot', { url: location.href });
 
     loadSaved();
+    loadTags();
     render();
     sync();
 
@@ -522,6 +865,12 @@
       if (storageKey && event.key === storageKey) {
         accountKey = null;
         cachedAccountKey = null;
+        sync();
+      }
+
+      if (tagStorageKey && event.key === tagStorageKey) {
+        tagAccountKey = null;
+        tagsReady = false;
         sync();
       }
     });
