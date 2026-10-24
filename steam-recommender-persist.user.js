@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Recommender — persistent "Your Playtime" exclusions
 // @namespace    steamrec
-// @version      2.0.0
+// @version      2.0.1
 // @description  Remembers Exclude/Include choices in "Your Playtime" on the Steam Interactive Recommender and re-applies them after reload.
 // @author       Ivan
 // @match        https://store.steampowered.com/recommender*
@@ -65,8 +65,20 @@
 
     const query = new URLSearchParams(location.search);
     const id = query.get('steamid') || query.get('steam_id') || query.get('steamid64');
+    if (id && /^\d+$/.test(id)) return id;
 
-    return id && /^\d+$/.test(id) ? id : null;
+    // Last resort: Steam stores the logged-in SteamID at the start of this cookie.
+    try {
+      const cookie = document.cookie.match(/(?:^|;\s*)steamLoginSecure=([^;]+)/);
+      if (cookie) {
+        const value = decodeURIComponent(cookie[1]).split('||')[0];
+        if (/^\d+$/.test(value)) return value;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return null;
   }
 
   function loadSaved() {
