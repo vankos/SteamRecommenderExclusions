@@ -1,9 +1,13 @@
 // ==UserScript==
-// @name         Steam Recommender — persistent "Your Relevant Playtime" exclusions
+// @name         Steam Recommender — persistent playtime exclusions and tag filters
 // @namespace    steamrec
-// @version      3.2.1
+// @version      3.3.0
 // @description  Remembers Exclude/Include choices in "Your Relevant Playtime" and the tag filters on the Steam Interactive Recommender, and re-applies them after reload.
 // @author       Ivan
+// @homepageURL  https://github.com/vankos/SteamRecommenderExclusions
+// @supportURL   https://github.com/vankos/SteamRecommenderExclusions/issues
+// @updateURL    https://raw.githubusercontent.com/vankos/SteamRecommenderExclusions/main/steam-recommender-persist.user.js
+// @downloadURL  https://raw.githubusercontent.com/vankos/SteamRecommenderExclusions/main/steam-recommender-persist.user.js
 // @match        https://store.steampowered.com/recommender*
 // @include      https://store.steampowered.com/recommender*
 // @run-at       document-start

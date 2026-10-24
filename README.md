@@ -3,6 +3,8 @@
 Tampermonkey-скрипт для страницы
 <https://store.steampowered.com/recommender/>.
 
+Репозиторий: <https://github.com/vankos/SteamRecommenderExclusions>
+
 ## Что делает
 
 На странице интерактивного рекомендера есть:
@@ -17,8 +19,8 @@ Steam хранит и то, и другое только в памяти стр�
 
 - запоминает исключённые игры и выбранные теги в `localStorage` браузера;
 - после загрузки страницы сам нажимает те же кнопки **Exclude / Include**;
-- сам добавляет сохранённые теги в **Add Tag Filters** и **Add Tag Exclusions**
-  через тот же автокомплит, что и пользователь;
+- сам применяет сохранённые теги в **Add Tag Filters** и **Add Tag Exclusions**
+  напрямую через состояние страницы — без вписывания в поле ввода;
 - показывает плашку внизу слева: `SteamRec: N excluded · tags M`;
 - умеет сбрасывать сохранённые выборы (кнопка `reset`, нажать дважды).
 
@@ -32,11 +34,33 @@ Steam. Он ищет на странице кнопки с текстом `Exclu
 
 ## Установка
 
+### Из GitHub (рекомендуется)
+
+1. Установите [Tampermonkey](https://www.tampermonkey.net/).
+2. Откройте raw-ссылку:
+   <https://raw.githubusercontent.com/vankos/SteamRecommenderExclusions/main/steam-recommender-persist.user.js>
+3. Tampermonkey предложит установить скрипт — нажмите **Install**.
+4. Откройте <https://store.steampowered.com/recommender/> и обновите страницу.
+
+### Вручную
+
 1. Установите [Tampermonkey](https://www.tampermonkey.net/).
 2. Панель Tampermonkey → **Create a new script**.
 3. Вставьте содержимое `steam-recommender-persist.user.js`.
 4. **Ctrl+S**.
 5. Откройте <https://store.steampowered.com/recommender/> и обновите страницу.
+
+## Обновления
+
+В скрипте указаны:
+
+- `@updateURL` — raw-ссылка на `steam-recommender-persist.user.js` в этом репозитории;
+- `@downloadURL` — та же raw-ссылка;
+- `@version` — текущая версия.
+
+Tampermonkey проверяет обновления по `@updateURL`. Когда в репозитории появляется
+новая версия, он предложит обновиться. Вручную — открыть raw-ссылку и нажать
+**Update** / **Install**.
 
 ## Использование
 
