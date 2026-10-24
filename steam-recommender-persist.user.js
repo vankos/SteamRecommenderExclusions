@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Recommender — persistent "Your Relevant Playtime" exclusions
 // @namespace    steamrec
-// @version      3.1.0
+// @version      3.2.0
 // @description  Remembers Exclude/Include choices in "Your Relevant Playtime" and the tag filters on the Steam Interactive Recommender, and re-applies them after reload.
 // @author       Ivan
 // @match        https://store.steampowered.com/recommender*
@@ -439,6 +439,71 @@
     return false;
   }
 
+  function buildTagNameMap() {
+    const map = new Map();
+
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key || !/^LocalizedTagNames2?_/i.test(key)) continue;
+
+      let data;
+      try {
+        data = JSON.parse(localStorage.getItem(key) || 'null');
+      } catch {
+        continue;
+      }
+      if (!data) continue;
+
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          if (!item) continue;
+          const id = Number(item.tagid ?? item.id ?? item.tag_id);
+          const name = item.name ?? item.tag_name ?? item.label;
+          if (Number.isFinite(id) && typeof name === 'string') {
+            map.set(name.trim().toLowerCase(), id);
+          }
+        }
+      } else if (typeof data === 'object') {
+        for (const [id, name] of Object.entries(data)) {
+          const num = Number(id);
+          if (Number.isFinite(num) && typeof name === 'string') {
+            map.set(name.trim().toLowerCase(), num);
+          }
+        }
+      }
+    }
+
+    return map;
+  }
+
+  /**
+   * Find the React fiber that owns filterTags / excludeTags. The new UI is a
+   * React app; setting those arrays directly avoids fighting the autocomplete.
+   */
+  function findTagControllerFiber(block) {
+    if (!block) return null;
+
+    const key = Object.keys(block).find((name) =>
+      name.startsWith('__reactFiber$')
+    );
+    if (!key) return null;
+
+    let fiber = block[key];
+
+    for (let depth = 0; depth < 20 && fiber; depth++, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (
+        props &&
+        (typeof props.onFilterTagsChange === 'function' ||
+          typeof props.onExcludeTagsChange === 'function')
+      ) {
+        return fiber;
+      }
+    }
+
+    return null;
+  }
+
   async function applyTags(blocks) {
     if (tagsApplying) return;
 
@@ -446,8 +511,56 @@
     lastTagApplyAt = Date.now();
 
     try {
+      // Preferred path: update the React state directly.
+      const controller =
+        findTagControllerFiber(blocks.filters) ||
+        findTagControllerFiber(blocks.excludes);
+      let usedReact = false;
+
+      if (controller) {
+        const props = controller.memoizedProps;
+        const nameMap = buildTagNameMap();
+
+        for (const kind of ['filters', 'excludes']) {
+          const names = savedTags[kind];
+          if (!names.length) continue;
+
+          const currentIds = Array.isArray(
+            kind === 'filters' ? props.filterTags : props.excludeTags
+          )
+            ? kind === 'filters'
+              ? props.filterTags
+              : props.excludeTags
+            : [];
+
+          const ids = [];
+          for (const name of names) {
+            const id = nameMap.get(name.trim().toLowerCase());
+            if (Number.isFinite(id)) ids.push(id);
+          }
+
+          const merged = Array.from(new Set([...currentIds, ...ids]));
+          if (merged.length === currentIds.length) continue;
+
+          const setter =
+            kind === 'filters'
+              ? props.onFilterTagsChange
+              : props.onExcludeTagsChange;
+
+          if (typeof setter === 'function') {
+            setter(merged);
+            usedReact = true;
+            log('tags set via react', { kind, ids, merged });
+          }
+        }
+
+        if (usedReact) await wait(250);
+      }
+
+      // Verify what actually appeared. Anything still missing is retried via
+      // the autocomplete input (or if the fiber path was unavailable).
       for (const kind of ['filters', 'excludes']) {
-        const block = blocks[kind];
+        const block = findTagBlocks()[kind];
         if (!block) continue;
 
         const current = readChips(block);
