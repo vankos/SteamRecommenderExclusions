@@ -1,25 +1,29 @@
-# Steam Recommender — сохранение исключений из «Your Playtime»
+# Steam Recommender — сохранение исключений из «Your Relevant Playtime»
 
 Tampermonkey-скрипт для страницы
 <https://store.steampowered.com/recommender/>.
 
 ## Что делает
 
-На странице интерактивного рекомендера есть левая колонка **Your Playtime**
-(«Ваше игровое время»). У каждой игры есть переключатель **Exclude / Include**.
+На странице интерактивного рекомендера есть левая колонка
+**Your Relevant Playtime**. У каждой игры есть кнопка **Exclude / Include**.
 Steam хранит этот выбор только в памяти страницы, поэтому после перезагрузки
 он сбрасывается.
 
 Скрипт:
 
-- запоминает выбор в `localStorage` браузера (отдельно для каждого Steam-аккаунта);
-- после загрузки страницы сам нажимает те же кнопки **Exclude / Include**,
-  которые нажимал пользователь;
+- запоминает выбор в `localStorage` браузера;
+- после загрузки страницы сам нажимает те же кнопки **Exclude / Include**;
 - показывает плашку внизу слева: `SteamRec: N excluded`;
 - умеет сбрасывать сохранённые выборы (кнопка `reset`, нажать дважды).
 
 Скрипт **не перехватывает сетевые запросы** и не меняет настройки аккаунта
-Steam — он просто работает с теми же кнопками на странице.
+Steam. Он ищет на странице кнопки с текстом `Exclude` / `Include`
+(а также `Исключить` / `Включить`), поднимается от кнопки до строки с игрой и
+берёт `appid` из ссылки `/app/<id>` или картинки `/apps/<id>/`.
+
+Это версия под **новый интерфейс Steam** (`#StoreTemplate`), где нет старых
+классов `PlaytimeList` / `PlayedGame` / `IgnoreToggle`.
 
 ## Установка
 
@@ -41,8 +45,11 @@ Steam — он просто работает с теми же кнопками �
 Ключ в `localStorage` сайта `store.steampowered.com`:
 
 ```
-steamrec.excluded.v1.<steamid>
+steamrec.excluded.v2.<account>
 ```
+
+`<account>` — SteamID из ссылки на профиль, либо vanity-имя, либо `default`,
+если на странице не нашлось ссылки на профиль.
 
 Значение — JSON-объект вида `{ "12345": true, "67890": false }`, где `true` —
 игра исключена, `false` — явно включена.
@@ -66,13 +73,28 @@ steamrec.excluded.v1.<steamid>
 ```js
 console.log({
   badge: !!document.getElementById('steamrec-badge'),
-  list: document.querySelectorAll('[class*="PlaytimeList"]').length,
-  rows: document.querySelectorAll('[class*="PlayedGame"]').length,
-  toggles: document.querySelectorAll('[class*="IgnoreToggle"]').length,
-  config: !!document.getElementById('application_config'),
+  buttons: [...document.querySelectorAll('button')].filter((b) =>
+    /^(exclude|include|исключить|включить)$/i.test((b.textContent || '').trim())
+  ).length,
+  appLinks: document.querySelectorAll('a[href*="/app/"]').length,
+  appImages: document.querySelectorAll('img[src*="/apps/"]').length,
   steamrec: Object.keys(localStorage).filter((k) => k.startsWith('steamrec')),
 });
 ```
+
+### Плашка пишет `waiting for buttons…`
+
+Скрипт не нашёл ни одной кнопки `Exclude` / `Include`. Возможные причины:
+
+- страница ещё не догрузилась (подождите несколько секунд);
+- вы не авторизованы в Steam;
+- Steam изменил текст кнопок — тогда нужен отчёт из debug-режима.
+
+### Плашка пишет `buttons found, no appid`
+
+Кнопки есть, но скрипт не смог понять, к какой игре они относятся. В debug-отчёте
+будет блок `unmappedSample` — цепочка элементов вокруг первой такой кнопки.
+Пришлите этот блок, и я добавлю нужный селектор.
 
 ### Плашка есть, но выбор не сохраняется
 
@@ -82,20 +104,18 @@ console.log({
 https://store.steampowered.com/recommender/?snr=1_12_70_&steamrec_debug=1
 ```
 
-Внизу появится панель с отчётом. Нажмите **copy report** и пришлите отчёт —
-в нём видно `saved`, `autoClicks`, `rows` и `lastError`.
+Внизу появится панель с отчётом. Нажмите **copy report** и пришлите отчёт.
+В нём видно:
 
-### Плашка пишет `waiting for list…` или `list is empty`
-
-Скрипт не нашёл список игр. Возможные причины:
-
-- страница ещё не догрузилась (подождите несколько секунд);
-- вы не авторизованы в Steam;
-- Steam изменил вёрстку — тогда нужен отчёт из debug-режима.
+- `saved` — что уже сохранено;
+- `buttons` / `mapped` / `unmapped` — сколько кнопок найдено и к скольким
+  удалось привязать `appid`;
+- `autoClicks` — сколько кнопок скрипт нажал сам;
+- `lastError` — текст ошибки, если была.
 
 ## Ограничения
 
 - Это локальное решение, а не сохранение в аккаунте Steam.
 - Скрипт рассчитан на текущую вёрстку страницы (2026). Если Valve поменяет
-  классы или структуру списка, селекторы могут потребовать обновления.
+  текст кнопок или структуру строк, может потребоваться обновление.
 - Скрипт не трогает ползунки, теги и другие настройки рекомендера.

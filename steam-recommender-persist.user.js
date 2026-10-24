@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Steam Recommender — persistent "Your Playtime" exclusions
+// @name         Steam Recommender — persistent "Your Relevant Playtime" exclusions
 // @namespace    steamrec
-// @version      2.0.1
-// @description  Remembers Exclude/Include choices in "Your Playtime" on the Steam Interactive Recommender and re-applies them after reload.
+// @version      3.0.0
+// @description  Remembers Exclude/Include choices in "Your Relevant Playtime" on the Steam Interactive Recommender and re-applies them after reload.
 // @author       Ivan
 // @match        https://store.steampowered.com/recommender*
 // @include      https://store.steampowered.com/recommender*
@@ -14,19 +14,26 @@
   'use strict';
 
   const LOG = '[SteamRec]';
-  const PREFIX = 'steamrec.excluded.v1.';
+  const KEY_PREFIX = 'steamrec.excluded.v2.';
   const DEBUG = /[?&]steamrec_debug=1(?:&|$)/.test(location.search);
+  const ACTION_RE = /^(exclude|include|исключить|включить)$/i;
 
-  let steamId = null;
+  let accountKey = null;
   let storageKey = null;
   let saved = new Map(); // appid -> true (excluded) / false (explicitly included)
-  let lastAutoClick = 0;
   let programmaticClick = false;
-  let listObserver = null;
-  let observedList = null;
+  let lastAutoClick = 0;
   let syncTimer = 0;
   let lastError = null;
-  let stats = { listFound: false, rows: 0, ignoredRows: 0, clicks: 0, autoClicks: 0 };
+
+  const stats = {
+    buttons: 0,
+    mapped: 0,
+    unmapped: 0,
+    excluded: 0,
+    clicks: 0,
+    autoClicks: 0,
+  };
 
   function log(...args) {
     console.log(LOG, ...args);
@@ -38,60 +45,118 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Config and storage
+  // Finding the Exclude / Include buttons and their game rows
   // ---------------------------------------------------------------------------
 
-  function readConfig() {
-    const el = document.getElementById('application_config');
-    if (!el) return null;
-
-    try {
-      return JSON.parse(el.getAttribute('data-config') || '{}') || {};
-    } catch (e) {
-      fail('parse config', e);
-      return null;
-    }
+  function isActionButton(el) {
+    return (
+      el &&
+      el.tagName === 'BUTTON' &&
+      ACTION_RE.test((el.textContent || '').trim())
+    );
   }
 
-  function detectSteamId() {
-    const config = readConfig();
-    if (config) {
-      const id = config.STEAM_ID || config.steamid || config.steam_id || config.STEAMID;
-      if (id) return String(id);
-    }
+  function getActionButtons() {
+    return Array.from(document.querySelectorAll('button')).filter(isActionButton);
+  }
 
-    const pathMatch = location.pathname.match(/\/recommender\/(\d+)/);
-    if (pathMatch) return pathMatch[1];
+  function appIdFromHref(href) {
+    const match = String(href || '').match(/\/app\/(\d+)/);
+    return match ? match[1] : null;
+  }
 
-    const query = new URLSearchParams(location.search);
-    const id = query.get('steamid') || query.get('steam_id') || query.get('steamid64');
-    if (id && /^\d+$/.test(id)) return id;
+  function appIdFromSrc(src) {
+    const match = String(src || '').match(/\/apps\/(\d+)\//);
+    return match ? match[1] : null;
+  }
 
-    // Last resort: Steam stores the logged-in SteamID at the start of this cookie.
-    try {
-      const cookie = document.cookie.match(/(?:^|;\s*)steamLoginSecure=([^;]+)/);
-      if (cookie) {
-        const value = decodeURIComponent(cookie[1]).split('||')[0];
-        if (/^\d+$/.test(value)) return value;
+  /**
+   * Walk up from the button until an ancestor contains exactly one game.
+   * The first such ancestor is the row; if we reach an ancestor with several
+   * games, we've climbed past the row into the list.
+   */
+  function findRow(button) {
+    let el = button;
+
+    for (let depth = 0; depth < 12 && el; depth++, el = el.parentElement) {
+      const ids = new Set();
+
+      for (const link of el.querySelectorAll('a[href*="/app/"]')) {
+        const appid = appIdFromHref(link.getAttribute('href'));
+        if (appid) ids.add(appid);
       }
-    } catch {
-      /* ignore */
+
+      for (const img of el.querySelectorAll('img[src*="/apps/"]')) {
+        const appid = appIdFromSrc(img.getAttribute('src'));
+        if (appid) ids.add(appid);
+      }
+
+      const dataAppid =
+        el.getAttribute('data-appid') || el.getAttribute('data-app-id');
+      if (dataAppid && /^\d+$/.test(dataAppid)) ids.add(dataAppid);
+
+      // Last resort: the row may use a CSS background-image or a data attribute
+      // instead of an <img>/<a>. Look for /apps/<id>/ or /app/<id> in the HTML.
+      if (ids.size === 0) {
+        const html = el.outerHTML || '';
+        const re = /\/(?:apps|app)\/(\d+)(?:\/|["'?])/g;
+        let match;
+        while ((match = re.exec(html))) ids.add(match[1]);
+      }
+
+      if (ids.size === 1) {
+        return { row: el, appid: Array.from(ids)[0] };
+      }
+
+      if (ids.size > 1) {
+        // We've reached the list, not a single row.
+        return null;
+      }
     }
 
     return null;
   }
 
-  function loadSaved() {
-    const sid = detectSteamId();
-    if (!sid) {
-      log('no SteamID found');
-      return false;
+  /** The button label is the action: "Include" means the game is excluded. */
+  function buttonExcluded(button) {
+    return /^(include|включить)$/i.test((button.textContent || '').trim());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Account + storage
+  // ---------------------------------------------------------------------------
+
+  let cachedAccountKey = null;
+
+  function getAccountKey() {
+    if (cachedAccountKey) return cachedAccountKey;
+
+    for (const link of document.querySelectorAll('a[href*="/profiles/"]')) {
+      const match = (link.getAttribute('href') || '').match(/\/profiles\/(\d+)/);
+      if (match) {
+        cachedAccountKey = match[1];
+        return cachedAccountKey;
+      }
     }
 
-    if (steamId === sid) return true;
+    for (const link of document.querySelectorAll('a[href*="/id/"]')) {
+      const match = (link.getAttribute('href') || '').match(/\/id\/([^/?#]+)/);
+      if (match) {
+        cachedAccountKey = match[1];
+        return cachedAccountKey;
+      }
+    }
 
-    steamId = sid;
-    storageKey = PREFIX + sid;
+    return 'default';
+  }
+
+  function loadSaved() {
+    const key = getAccountKey();
+
+    if (accountKey === key && storageKey) return true;
+
+    accountKey = key;
+    storageKey = KEY_PREFIX + key;
     saved = new Map();
 
     try {
@@ -108,7 +173,7 @@
       fail('read storage', e);
     }
 
-    log('loaded', { steamId, storageKey, saved: saved.size });
+    log('loaded', { accountKey, storageKey, saved: saved.size });
     return true;
   }
 
@@ -127,92 +192,52 @@
   }
 
   // ---------------------------------------------------------------------------
-  // DOM
+  // Applying saved choices
   // ---------------------------------------------------------------------------
 
-  function getAppId(row) {
-    const link = row.querySelector('a[href*="/app/"]');
-    if (link) {
-      const match = (link.getAttribute('href') || '').match(/\/app\/(\d+)/);
-      if (match) return match[1];
-    }
+  function sync() {
+    if (!loadSaved()) return;
 
-    const img = row.querySelector('img[src*="/apps/"]');
-    if (img) {
-      const match = (img.getAttribute('src') || '').match(/\/apps\/(\d+)\//);
-      if (match) return match[1];
-    }
+    const buttons = getActionButtons();
+    stats.buttons = buttons.length;
+    stats.mapped = 0;
+    stats.unmapped = 0;
 
-    return null;
-  }
+    for (const button of buttons) {
+      const found = findRow(button);
 
-  function isIgnored(row) {
-    const hasIgnoredClass = Array.from(row.classList).some((name) =>
-      /(^|_)Ignored(_|$)/.test(name)
-    );
-    if (hasIgnoredClass) return true;
-
-    // Fallback: the toggle says "Include" only when the game is excluded.
-    const toggle = getToggle(row);
-    if (!toggle) return false;
-
-    const label = (toggle.textContent || '').trim();
-    const unignore = localizedLabel('#PlaytimeList_UnIgnore');
-
-    return !!unignore && label === unignore;
-  }
-
-  function localizedLabel(key) {
-    try {
-      const manager = window.LocalizationManager;
-      if (manager && typeof manager.LocalizeString === 'function') {
-        return (manager.LocalizeString(key) || '').trim();
+      if (!found) {
+        stats.unmapped++;
+        continue;
       }
-    } catch {
-      /* ignore */
-    }
-    return '';
-  }
 
-  function getToggle(row) {
-    const toggle = row.querySelector('[class*="IgnoreToggle"]');
-    if (toggle) return toggle;
+      stats.mapped++;
 
-    const labels = new Set(
-      [localizedLabel('#PlaytimeList_Ignore'), localizedLabel('#PlaytimeList_UnIgnore')]
-        .filter(Boolean)
-    );
+      if (!saved.has(found.appid)) continue;
 
-    if (labels.size) {
-      for (const el of row.querySelectorAll('div, span, a, button')) {
-        if (labels.has((el.textContent || '').trim())) return el;
+      const want = saved.get(found.appid);
+      const current = buttonExcluded(button);
+      if (want === current) continue;
+
+      // One click per pass: the page re-renders, then the observer calls sync().
+      if (Date.now() - lastAutoClick < 300) continue;
+      lastAutoClick = Date.now();
+      stats.autoClicks++;
+
+      log('auto-click', { appid: found.appid, want, current });
+
+      programmaticClick = true;
+      try {
+        button.click();
+      } finally {
+        programmaticClick = false;
       }
+
+      break;
     }
 
-    return null;
-  }
-
-  function getList() {
-    return document.querySelector('[class*="PlaytimeList"]');
-  }
-
-  function getRows(list) {
-    return list ? Array.from(list.querySelectorAll('[class*="PlayedGame"]')) : [];
-  }
-
-  function attachObserver(list) {
-    if (!list || list === observedList) return;
-
-    if (listObserver) listObserver.disconnect();
-
-    observedList = list;
-    listObserver = new MutationObserver(scheduleSync);
-    listObserver.observe(list, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['class'],
-    });
+    stats.excluded = buttons.filter(buttonExcluded).length;
+    render();
   }
 
   function scheduleSync() {
@@ -224,57 +249,6 @@
     }, 80);
   }
 
-  function sync() {
-    if (!loadSaved()) return;
-
-    const list = getList();
-    if (!list) {
-      render();
-      return;
-    }
-
-    attachObserver(list);
-
-    const rows = getRows(list);
-    stats.listFound = rows.length > 0;
-    stats.rows = rows.length;
-
-    if (!rows.length) {
-      render();
-      return;
-    }
-
-    for (const row of rows) {
-      const appid = getAppId(row);
-      if (!appid || !saved.has(appid)) continue;
-
-      const want = saved.get(appid);
-      const now = isIgnored(row);
-      if (want === now) continue;
-
-      const toggle = getToggle(row);
-      if (!toggle) continue;
-
-      if (Date.now() - lastAutoClick < 300) continue;
-      lastAutoClick = Date.now();
-      stats.autoClicks++;
-
-      log('auto-click', { appid, want });
-      programmaticClick = true;
-      try {
-        toggle.click();
-      } finally {
-        programmaticClick = false;
-      }
-
-      // The click re-renders the list; let the observer call sync() again
-      // for the next saved game instead of clicking detached rows.
-      break;
-    }
-
-    render();
-  }
-
   // Remember real user clicks.
   document.addEventListener(
     'click',
@@ -282,54 +256,78 @@
       const target = event.target instanceof Element ? event.target : null;
       if (!target) return;
 
-      const toggle = target.closest('[class*="IgnoreToggle"]');
-      if (!toggle) return;
+      const button = target.closest('button');
+      if (!button || !isActionButton(button)) return;
+      if (programmaticClick) return;
 
-      const row = toggle.closest('[class*="PlayedGame"]');
-      if (!row) return;
-
-      const appid = getAppId(row);
-      if (!appid) return;
-
-      const fromScript = programmaticClick;
-      const wasIgnored = isIgnored(row);
-      const want = !wasIgnored;
-
-      stats.clicks++;
-      log('click', { appid, wasIgnored, want, fromScript });
-
-      if (!fromScript) {
-        saved.set(appid, want);
-        persist();
+      const found = findRow(button);
+      if (!found) {
+        log('click without appid', {
+          button: button.outerHTML.slice(0, 300),
+        });
+        return;
       }
 
-      setTimeout(() => {
-        if (!fromScript) sync();
-        else render();
-      }, 0);
+      const current = buttonExcluded(button);
+      const want = !current;
+
+      stats.clicks++;
+      saved.set(found.appid, want);
+      persist();
+
+      log('click', { appid: found.appid, current, want });
+
+      setTimeout(sync, 0);
     },
     true
   );
 
   // ---------------------------------------------------------------------------
-  // Badge and debug panel
+  // Badge + debug panel
   // ---------------------------------------------------------------------------
 
+  function sampleAncestors(button) {
+    const chain = [];
+    let el = button;
+
+    for (let depth = 0; depth < 10 && el; depth++, el = el.parentElement) {
+      chain.push({
+        depth,
+        tag: el.tagName,
+        id: el.id || '',
+        cls: typeof el.className === 'string' ? el.className : '',
+        kids: el.children.length,
+        text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 140),
+      });
+    }
+
+    return chain;
+  }
+
   function getReport() {
-    const list = getList();
-    const rows = getRows(list);
+    const buttons = getActionButtons();
+    const mapped = [];
+    let firstUnmapped = null;
+
+    for (const button of buttons) {
+      const found = findRow(button);
+      if (found) mapped.push({ appid: found.appid, excluded: buttonExcluded(button) });
+      else if (!firstUnmapped) firstUnmapped = button;
+    }
 
     return {
       url: location.href,
-      steamId,
+      accountKey,
       storageKey,
+      buttons: buttons.length,
+      mapped: mapped.length,
+      unmapped: buttons.length - mapped.length,
+      excluded: buttons.filter(buttonExcluded).length,
       saved: Object.fromEntries(saved),
-      listFound: stats.listFound,
-      rows: rows.length,
-      ignoredRows: rows.filter(isIgnored).length,
       clicks: stats.clicks,
       autoClicks: stats.autoClicks,
       lastError,
+      unmappedSample: firstUnmapped ? sampleAncestors(firstUnmapped) : null,
     };
   }
 
@@ -361,7 +359,7 @@
     reset.id = 'steamrec-badge-reset';
     reset.type = 'button';
     reset.textContent = 'reset';
-    reset.title = 'Forget the exclusions saved by this script for this Steam account';
+    reset.title = 'Forget the exclusions saved by this script';
     reset.style.cssText =
       'all:unset;cursor:pointer;color:#66c0f4;text-decoration:underline;font:inherit;margin-left:8px;';
 
@@ -403,8 +401,8 @@
       'left:14px',
       'bottom:56px',
       'z-index:2147483001',
-      'width:430px',
-      'max-height:45vh',
+      'width:460px',
+      'max-height:50vh',
       'overflow:auto',
       'padding:8px',
       'border:1px solid #2a3f5a',
@@ -450,17 +448,14 @@
   function render() {
     const badge = ensureBadge();
     const text = badge.querySelector('#steamrec-badge-text');
-    const list = getList();
-    const rows = getRows(list);
-    const ignored = rows.filter(isIgnored).length;
 
     let label;
-    if (!list) {
-      label = 'SteamRec: waiting for list…';
-    } else if (!rows.length) {
-      label = 'SteamRec: list is empty';
+    if (stats.buttons === 0) {
+      label = 'SteamRec: waiting for buttons…';
+    } else if (stats.mapped === 0) {
+      label = 'SteamRec: buttons found, no appid';
     } else {
-      label = 'SteamRec: ' + ignored + ' excluded';
+      label = 'SteamRec: ' + stats.excluded + ' excluded';
     }
 
     if (text) text.textContent = label;
@@ -488,23 +483,24 @@
     setTimeout(sync, 3000);
 
     setTimeout(() => {
-      if (!getList()) {
-        log('list not found after 6s', {
-          root: !!document.getElementById('recommender_root'),
-          lists: document.querySelectorAll('[class*="PlaytimeList"]').length,
-        });
+      if (getActionButtons().length === 0) {
+        log('no Exclude/Include buttons after 8s');
         render();
       }
-    }, 6000);
+    }, 8000);
 
-    new MutationObserver(scheduleSync).observe(document.documentElement, {
+    new MutationObserver(scheduleSync).observe(document.body || document.documentElement, {
       childList: true,
       subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['class', 'disabled'],
     });
 
     window.addEventListener('storage', (event) => {
       if (storageKey && event.key === storageKey) {
-        steamId = null; // force reload
+        accountKey = null;
+        cachedAccountKey = null;
         sync();
       }
     });
