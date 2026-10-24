@@ -131,6 +131,27 @@
   function getAccountKey() {
     if (cachedAccountKey) return cachedAccountKey;
 
+    // Steam's page globals are the most reliable source.
+    try {
+      if (
+        typeof window.g_steamID === 'string' &&
+        /^\d{17}$/.test(window.g_steamID)
+      ) {
+        cachedAccountKey = window.g_steamID;
+        return cachedAccountKey;
+      }
+
+      if (
+        typeof window.g_AccountID === 'number' &&
+        window.g_AccountID > 0
+      ) {
+        cachedAccountKey = 'account' + window.g_AccountID;
+        return cachedAccountKey;
+      }
+    } catch {
+      /* ignore */
+    }
+
     for (const link of document.querySelectorAll('a[href*="/profiles/"]')) {
       const match = (link.getAttribute('href') || '').match(/\/profiles\/(\d+)/);
       if (match) {
