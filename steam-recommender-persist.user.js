@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Recommender — persistent "Your Relevant Playtime" exclusions
 // @namespace    steamrec
-// @version      3.2.0
+// @version      3.2.1
 // @description  Remembers Exclude/Include choices in "Your Relevant Playtime" and the tag filters on the Steam Interactive Recommender, and re-applies them after reload.
 // @author       Ivan
 // @match        https://store.steampowered.com/recommender*
@@ -32,6 +32,8 @@
   let savedTags = { filters: [], excludes: [] };
   let tagsReady = false;
   let tagsApplying = false;
+  let tagsViaReact = false;
+  let lastTagNameMapSize = 0;
   let lastChipClickAt = 0;
   let lastTagApplyAt = 0;
 
@@ -454,8 +456,14 @@
       }
       if (!data) continue;
 
-      if (Array.isArray(data)) {
-        for (const item of data) {
+      const list = Array.isArray(data)
+        ? data
+        : data && Array.isArray(data.tags)
+          ? data.tags
+          : null;
+
+      if (list) {
+        for (const item of list) {
           if (!item) continue;
           const id = Number(item.tagid ?? item.id ?? item.tag_id);
           const name = item.name ?? item.tag_name ?? item.label;
@@ -463,7 +471,7 @@
             map.set(name.trim().toLowerCase(), id);
           }
         }
-      } else if (typeof data === 'object') {
+      } else if (data && typeof data === 'object') {
         for (const [id, name] of Object.entries(data)) {
           const num = Number(id);
           if (Number.isFinite(num) && typeof name === 'string') {
@@ -483,7 +491,7 @@
   function findTagControllerFiber(block) {
     if (!block) return null;
 
-    const key = Object.keys(block).find((name) =>
+    const key = Object.getOwnPropertyNames(block).find((name) =>
       name.startsWith('__reactFiber$')
     );
     if (!key) return null;
@@ -509,6 +517,7 @@
 
     tagsApplying = true;
     lastTagApplyAt = Date.now();
+    tagsViaReact = false;
 
     try {
       // Preferred path: update the React state directly.
@@ -520,6 +529,7 @@
       if (controller) {
         const props = controller.memoizedProps;
         const nameMap = buildTagNameMap();
+        lastTagNameMapSize = nameMap.size;
 
         for (const kind of ['filters', 'excludes']) {
           const names = savedTags[kind];
@@ -550,6 +560,7 @@
           if (typeof setter === 'function') {
             setter(merged);
             usedReact = true;
+            tagsViaReact = true;
             log('tags set via react', { kind, ids, merged });
           }
         }
@@ -799,6 +810,8 @@
         key: tagStorageKey,
         ready: tagsReady,
         applying: tagsApplying,
+        viaReact: tagsViaReact,
+        nameMapSize: lastTagNameMapSize,
         saved: savedTags,
         current: currentTags,
       },
